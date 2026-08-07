@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
+  <background android:drawable="@mipmap/bingoicon_background"/>
+  <foreground android:drawable="@mipmap/bingoicon_foreground"/>
+  <monochrome android:drawable="@mipmap/bingoicon_monochrome"/>
+</adaptive-icon>

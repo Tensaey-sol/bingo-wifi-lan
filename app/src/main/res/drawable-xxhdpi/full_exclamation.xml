@@ -1,0 +1,20 @@
+<!-- exclamation_circle.xml -->
+<layer-list xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!-- Background circle -->
+    <item>
+        <shape android:shape="oval">
+            <solid android:color="#000"/>
+        </shape>
+    </item>
+
+    <!-- Exclamation point -->
+    <item android:drawable="@drawable/exclamation_icon"> 
+        <padding
+            android:bottom="8dp"
+            android:left="8dp"
+            android:right="8dp"
+            android:top="8dp" />
+    </item>
+
+</layer-list>
