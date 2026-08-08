@@ -27,7 +27,6 @@ import java.util.Random;
 
 import static com.game.bingo.Settings.KEY_CURRENT_NAME;
 import static com.game.bingo.Settings.PREF_NAME;
-import static com.game.bingo.Start.peerCount;
 
 
 /**
@@ -137,8 +136,26 @@ public class Card extends com.game.bingo.Name {
     @Override
     protected void onDestroy() {
         super.onDestroy();
-        LocalBroadcastManager.getInstance(this).unregisterReceiver(tempReceiver2);
+        if (isCardScreen()) {
+            LocalBroadcastManager.getInstance(this).unregisterReceiver(tempReceiver2);
+            LocalBroadcastManager.getInstance(this).unregisterReceiver(peerLostReceiver);
+        }
     }
+
+    /** True for the Card activity itself, false for Game (which extends it). */
+    protected final boolean isCardScreen() {
+        return !(this instanceof Game);
+    }
+
+    /** The host went away, so there is no match to arrange for — back out to the lobby. */
+    private final BroadcastReceiver peerLostReceiver = new BroadcastReceiver() {
+        @Override
+        public void onReceive(Context context, Intent intent) {
+            if (isFinishing() || isDestroyed()) return;
+            Toast.makeText(getApplicationContext(), "Host disconnected", Toast.LENGTH_LONG).show();
+            finish();
+        }
+    };
 
     private boolean mVisible;
     private final Runnable mHideRunnable = new Runnable() {
@@ -174,30 +191,10 @@ public class Card extends com.game.bingo.Name {
     private BroadcastReceiver tempReceiver2 = new BroadcastReceiver() {
         @Override
         public void onReceive(Context context, Intent intent) {
-            String begin1 = intent.getStringExtra("begin1");
-            if("begin".equals(begin1)) {
-                if (next == null) {
-                    next = (Button) findViewById(R.id.next);
-                }
-                if (next != null && "BEGIN".equals(next.getText().toString())) {
-                    Intent intent2 = new Intent("data4");
-                    intent2.putExtra("ready", "ready");
-                    LocalBroadcastManager.getInstance(com.game.bingo.Card.this).sendBroadcast(intent2);
-                    Toast.makeText(getApplicationContext(), "Beginning", Toast.LENGTH_SHORT).show();
-                    // Force count sync in case "peer" message hasn't arrived yet
-                    count = peerCount + 1;
-                    finish();
-                    startActivity(intent1);
-                } else {
-                    Intent intent2 = new Intent("data4");
-                    intent2.putExtra("ready", "not ready");
-                    LocalBroadcastManager.getInstance(com.game.bingo.Card.this).sendBroadcast(intent2);
-                    Toast.makeText(getApplicationContext(), "Waiting for you to begin", Toast.LENGTH_SHORT).show();
-
-                }
-            } else if("ready".equals(begin1)){
-                // Force count sync in case "peer" message hasn't arrived yet
-                count = peerCount + 1;
+            // "go" comes from the host once every player has pressed BEGIN.
+            if ("go".equals(intent.getStringExtra("begin1"))) {
+                if (isFinishing() || isDestroyed()) return;
+                Toast.makeText(getApplicationContext(), "Beginning", Toast.LENGTH_SHORT).show();
                 finish();
                 startActivity(intent1);
             }
@@ -222,7 +219,13 @@ public class Card extends com.game.bingo.Name {
             }
         });
 
-        LocalBroadcastManager.getInstance(this).registerReceiver(tempReceiver2,new IntentFilter("data3"));
+        // Game extends Card, so guard this: only the arrange-your-card screen should
+        // react to "begin"/"ready". Without the guard a match in progress would also
+        // handle those and relaunch itself against a discarded layout.
+        if (isCardScreen()) {
+            LocalBroadcastManager.getInstance(this).registerReceiver(tempReceiver2, new IntentFilter("data3"));
+            LocalBroadcastManager.getInstance(this).registerReceiver(peerLostReceiver, new IntentFilter("peer_lost"));
+        }
         playerName = (TextView) findViewById(R.id.playername);
         TextView text = (TextView) findViewById(R.id.bingo);
         ImageView imageView = (ImageView) findViewById(R.id.imageView2);
@@ -298,20 +301,18 @@ public class Card extends com.game.bingo.Name {
                         {
                             text.setText("");
                             next.setText("BEGIN");
-                            if (!isReplay) {
-                                Intent peerIntent = new Intent("peer");
-                                peerIntent.putExtra("peer","peer");
-                                LocalBroadcastManager.getInstance(com.game.bingo.Card.this).sendBroadcast(peerIntent);
-                                com.game.bingo.Start.turn = count;
-                                count++;
-                            }
                             if (next != null) {
                                 next.setOnClickListener(new View.OnClickListener() {
+                                    @SuppressLint("SetTextI18n")
                                     @Override
                                     public void onClick(View v) {
                                         Intent intent = new Intent("data2");
                                         intent.putExtra("begin", "begin");
                                         LocalBroadcastManager.getInstance(com.game.bingo.Card.this).sendBroadcast(intent);
+                                        next.setEnabled(false);
+                                        next.setText("WAITING...");
+                                        Toast.makeText(getApplicationContext(),
+                                                "Waiting for the other players", Toast.LENGTH_SHORT).show();
                                     }
                                 });
                             }

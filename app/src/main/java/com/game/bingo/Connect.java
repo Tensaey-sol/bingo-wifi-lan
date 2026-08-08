@@ -7,8 +7,8 @@ import android.content.Context;
 import android.content.DialogInterface;
 import android.content.Intent;
 import android.graphics.Color;
-import android.location.LocationManager;
 import android.net.wifi.WifiManager;
+import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
 import android.transition.Fade;
@@ -189,11 +189,6 @@ public class Connect extends AppCompatActivity {
         rules.setEnabled(false);
         rules.setVisibility(View.INVISIBLE);
 
-        // Check Wi-Fi state and update UI accordingly
-        checkWifiState();
-
-        final LocationManager manager = (LocationManager) getSystemService(Context.LOCATION_SERVICE);
-
         rules.setOnClickListener(new View.OnClickListener() {
             @Override
             public void onClick(View view) {
@@ -204,12 +199,13 @@ public class Connect extends AppCompatActivity {
         wifi_on.setOnClickListener(new View.OnClickListener() {
             @Override
             public void onClick(View view) {
-                WifiManager wifiManager = (WifiManager) getApplicationContext().getSystemService(Context.WIFI_SERVICE);
-
-                if (!wifiManager.isWifiEnabled())
-                    wifiManager.setWifiEnabled(true);
-
-                checkWifiState();
+                // setWifiEnabled() is a no-op from API 29 on, so hand off to the system
+                // Wi-Fi picker instead; onResume() re-checks when the user comes back.
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                    startActivity(new Intent(android.provider.Settings.Panel.ACTION_WIFI));
+                } else {
+                    startActivity(new Intent(android.provider.Settings.ACTION_WIFI_SETTINGS));
+                }
             }
         });
 
@@ -217,12 +213,7 @@ public class Connect extends AppCompatActivity {
             @Override
             public void onClick(View v) {
                 Intent intent = new Intent(com.game.bingo.Connect.this, com.game.bingo.Start.class);
-                if(!manager.isProviderEnabled(LocationManager.GPS_PROVIDER)) {
-                    Toast.makeText(getApplicationContext(),"Enable Location mode in Settings", Toast.LENGTH_SHORT).show();
-                }
-                else {
-                    startActivity(intent, ActivityOptions.makeSceneTransitionAnimation(com.game.bingo.Connect.this).toBundle());
-                }
+                startActivity(intent, ActivityOptions.makeSceneTransitionAnimation(com.game.bingo.Connect.this).toBundle());
             }
         });
 
@@ -281,6 +272,13 @@ public class Connect extends AppCompatActivity {
         rules.setAnimation(inFromLeftAnimation(500));
     }
 
+
+    @Override
+    protected void onResume() {
+        super.onResume();
+        // Pick up any change the user made in the system Wi-Fi picker.
+        checkWifiState();
+    }
 
     @Override
     protected void onPostCreate(Bundle savedInstanceState) {

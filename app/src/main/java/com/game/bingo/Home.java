@@ -86,14 +86,6 @@ public class Home extends AppCompatActivity {
         window.setStatusBarColor(Color.TRANSPARENT);
 
         mContentView = findViewById(R.id.fullscreen_content);
-        WifiManager wifiManager = (WifiManager) getApplicationContext().getSystemService(Context.WIFI_SERVICE);
-
-        if (wifiManager.isWifiEnabled())
-            wifiManager.setWifiEnabled(false);
-
-        ActivityCompat.requestPermissions(this, new String[]{
-                Manifest.permission.ACCESS_FINE_LOCATION,
-                Manifest.permission.ACCESS_COARSE_LOCATION}, 101);
 
         SharedPreferences prefs = getSharedPreferences(PREF_NAME, Context.MODE_PRIVATE);
         isSoundOn = prefs.getBoolean(KEY_SOUND_STATE, true);
@@ -122,8 +114,6 @@ public class Home extends AppCompatActivity {
         quit.setOnClickListener(new View.OnClickListener() {
             @Override
             public void onClick(View v) {
-                if (wifiManager.isWifiEnabled())
-                    wifiManager.setWifiEnabled(false);
                 if (mediaPlayer != null) {
                     try {
                         mediaPlayer.stop();
@@ -141,13 +131,6 @@ public class Home extends AppCompatActivity {
                 // Load the currentName from SharedPreferences
                 SharedPreferences prefs = getSharedPreferences(PREF_NAME, Context.MODE_PRIVATE);
                 String currentName = prefs.getString(KEY_CURRENT_NAME, null);
-
-                // Check if WiFi is enabled
-                WifiManager wifiManager = (WifiManager) getApplicationContext().getSystemService(Context.WIFI_SERVICE);
-                if (wifiManager != null && !wifiManager.isWifiEnabled()) {
-                    // WiFi is not enabled, so turn it on
-                    wifiManager.setWifiEnabled(true);
-                }
 
                 Intent intent;
                 if (currentName == null || currentName.equals("Default Name")) {

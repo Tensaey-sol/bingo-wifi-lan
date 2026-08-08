@@ -34,8 +34,10 @@ import java.net.InetSocketAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
 import java.util.ArrayList;
-import java.util.Arrays;
+import java.util.Collections;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Set;
 
 /**
  * An example full-screen activity that shows and hides the system UI (i.e.
@@ -62,11 +64,25 @@ public class Start extends AppCompatActivity {
     static final int MESSAGE_READ = 1;
     ServerClass serverClass;
     ClientClass clientClass;
+    /** Client side: the one connection to the host. Null on the host. */
     SendReceive sendReceive;
-    public static int peerCount;
+    /** Host side: one connection per joined client, in join order. Empty on a client. */
+    final List<SendReceive> connections = Collections.synchronizedList(new ArrayList<SendReceive>());
+    /** Host side: player indexes that have finished arranging and pressed BEGIN. */
+    private final Set<Integer> readySet = new HashSet<>();
+    /** Cap on players in a single match, host included. */
+    public static final int MAX_PLAYERS = 8;
+    /** True on the device that pressed HOST. The host is always player 0 and runs the lobby. */
+    public static boolean isHost;
+    /** This device's player index. The host deals these out when the match starts. */
     public static int turn;
+    /** Player indexes that are out of the rotation: finished, or dropped out. */
     public static List<String> ignoreTurn;
+    /** Player indexes that have left for good. Survives replays; ignoreTurn does not. */
+    public static Set<String> departed = new HashSet<>();
     private volatile boolean isActive = true;
+    /** Set once the host has dealt out player indexes; nobody may join after that. */
+    private volatile boolean matchStarted = false;
 
     /**
      * If {@link #AUTO_HIDE} is set, the number of milliseconds to wait after
@@ -284,13 +300,20 @@ public class Start extends AppCompatActivity {
                 } catch (Exception e) { e.printStackTrace(); }
             }
         }
-        // Close the socket to break the SendReceive read loop
+        // Close the sockets to break the SendReceive read loops
         if (sendReceive != null) {
             try {
                 if (sendReceive.socket != null) {
                     sendReceive.socket.close();
                 }
             } catch (Exception e) { e.printStackTrace(); }
+        }
+        synchronized (connections) {
+            for (SendReceive c : connections) {
+                try {
+                    if (c.socket != null) c.socket.close();
+                } catch (Exception e) { e.printStackTrace(); }
+            }
         }
         // Close the server socket if we were hosting
         if (serverClass != null && serverClass.serverSocket != null) {
@@ -300,13 +323,11 @@ public class Start extends AppCompatActivity {
         }
         LocalBroadcastManager.getInstance(this).unregisterReceiver(tempReceiver);
         LocalBroadcastManager.getInstance(this).unregisterReceiver(tempReceiver2);
-        LocalBroadcastManager.getInstance(this).unregisterReceiver(tempReceiver3);
         LocalBroadcastManager.getInstance(this).unregisterReceiver(tempReceiver4);
         LocalBroadcastManager.getInstance(this).unregisterReceiver(tempReceiver5);
     }
 
     public class ServerClass extends Thread{
-        Socket socket;
         ServerSocket serverSocket;
 
         @Override
@@ -320,33 +341,119 @@ public class Start extends AppCompatActivity {
                         registerService(port);
                     }
                 });
-                socket = serverSocket.accept();
-                sendReceive = new SendReceive(socket);
-                sendReceive.start();
-                runOnUiThread(new Runnable() {
-                    @SuppressLint("SetTextI18n")
-                    @Override
-                    public void run() {
-                        text.setText("CONNECTED (HOST)");
-                        Button next = (Button) findViewById(R.id.nextBtn2);
-                        Button send = (Button) findViewById(R.id.send);
-                        next.setVisibility(View.VISIBLE);
-                        next.setEnabled(true);
-                        send.setVisibility(View.VISIBLE);
-                        send.setEnabled(true);
-                        Toast.makeText(Start.this, "Client Connected", Toast.LENGTH_SHORT).show();
+
+                // Keep taking joiners until the host starts the match or the activity goes away.
+                while (isActive && !matchStarted) {
+                    Socket socket = serverSocket.accept();
+                    if (matchStarted || connections.size() + 1 >= MAX_PLAYERS) {
+                        // Lobby is full, or the match already started: turn them away.
+                        try { socket.close(); } catch (IOException ignored) { }
+                        continue;
                     }
-                });
+                    SendReceive conn = new SendReceive(socket);
+                    connections.add(conn);
+                    conn.start();
+                    runOnUiThread(new Runnable() {
+                        @Override
+                        public void run() {
+                            if (!isFinishing() && !isDestroyed()) {
+                                Toast.makeText(Start.this, "Player joined", Toast.LENGTH_SHORT).show();
+                                updateLobby();
+                            }
+                        }
+                    });
+                }
             } catch (IOException e) {
                 e.printStackTrace();
             }
         }
     }
 
+    /**
+     * Put a message on the wire. The host is the hub, so it fans out to every client;
+     * a client only ever talks to the host.
+     */
+    private void sendToAll(String msg) {
+        if (msg == null) return;
+        byte[] bytes = msg.getBytes();
+        if (isHost) {
+            synchronized (connections) {
+                for (SendReceive c : connections) {
+                    c.write(bytes);
+                }
+            }
+        } else if (sendReceive != null) {
+            sendReceive.write(bytes);
+        }
+    }
+
+    /**
+     * Host only: pass a client's message on to the other clients, in the order the host
+     * received it. That relay order is what keeps every device's turn rotation in step.
+     */
+    private void relay(String msg, SendReceive from) {
+        byte[] bytes = msg.getBytes();
+        synchronized (connections) {
+            for (SendReceive c : connections) {
+                if (c != from) c.write(bytes);
+            }
+        }
+    }
+
+    /** Host only: note that a player has finished arranging, and start once everyone has. */
+    private void markReady(int playerIndex) {
+        if (!isHost) return;
+        readySet.add(playerIndex);
+        checkAllReady();
+    }
+
+    private void checkAllReady() {
+        if (!isHost || readySet.isEmpty()) return;
+        int required = Card.count - (ignoreTurn == null ? 0 : ignoreTurn.size());
+        if (required < 1) required = 1;
+        if (readySet.size() >= required) {
+            readySet.clear();
+            sendToAll("go");
+            Intent go = new Intent("data3");
+            go.putExtra("begin1", "go");
+            LocalBroadcastManager.getInstance(Start.this).sendBroadcast(go);
+        }
+    }
+
+    /**
+     * A player dropped out. Everyone takes them out of the turn rotation, so play carries
+     * on with the remaining players instead of stalling on a turn that will never come.
+     */
+    private void handlePlayerLeft(int playerIndex) {
+        if (ignoreTurn == null) ignoreTurn = new ArrayList<>();
+        departed.add(playerIndex + "");
+        if (!ignoreTurn.contains(playerIndex + "")) ignoreTurn.add(playerIndex + "");
+        readySet.remove(playerIndex);
+
+        Intent intent = new Intent("player_left");
+        intent.putExtra("playerIndex", playerIndex);
+        LocalBroadcastManager.getInstance(this).sendBroadcast(intent);
+
+        checkAllReady();
+    }
+
+    @SuppressLint("SetTextI18n")
+    private void updateLobby() {
+        if (!isHost || text == null) return;
+        int players = connections.size() + 1;
+        text.setText("HOSTING - " + players + (players == 1 ? " player" : " players") + " connected");
+        Button next = (Button) findViewById(R.id.nextBtn2);
+        boolean canStart = !connections.isEmpty() && !matchStarted;
+        next.setVisibility(canStart ? View.VISIBLE : View.INVISIBLE);
+        next.setEnabled(canStart);
+    }
+
     private class SendReceive extends Thread{
         private Socket socket;
         private InputStream inputStream;
         private OutputStream outputStream;
+        /** Host side: which player this connection is, or -1 until the match starts. */
+        volatile int playerIndex = -1;
 
         public SendReceive(Socket skt)
         {
@@ -381,6 +488,8 @@ public class Start extends AppCompatActivity {
                             sb.delete(0, newlineIdx + 1);
 
                             if (!completeMsg.isEmpty()) {
+                                // The hub has to forward whatever a client says to the rest.
+                                if (isHost) relay(completeMsg, this);
                                 byte[] msgBytes = completeMsg.getBytes();
                                 handler.obtainMessage(MESSAGE_READ, msgBytes.length, -1, msgBytes).sendToTarget();
                             }
@@ -404,14 +513,30 @@ public class Start extends AppCompatActivity {
             } catch (IOException e) {
                 e.printStackTrace();
             }
+            connections.remove(this);
+            final int lost = playerIndex;
             runOnUiThread(() -> {
-                if (isActive && !isFinishing() && !isDestroyed()) {
-                    Toast.makeText(Start.this, "Disconnected", Toast.LENGTH_SHORT).show();
+                if (!isActive || isFinishing() || isDestroyed()) return;
+                if (isHost) {
+                    if (lost < 0) {
+                        // Left the lobby before indexes were handed out: nothing to announce.
+                        Toast.makeText(Start.this, "A player left the lobby", Toast.LENGTH_SHORT).show();
+                        updateLobby();
+                    } else {
+                        Toast.makeText(Start.this, "Player " + (lost + 1) + " disconnected", Toast.LENGTH_SHORT).show();
+                        sendToAll("left " + lost);
+                        handlePlayerLeft(lost);
+                    }
+                } else {
+                    // A client's only link is to the host, so losing it ends the match.
+                    Toast.makeText(Start.this, "Host disconnected", Toast.LENGTH_SHORT).show();
+                    LocalBroadcastManager.getInstance(Start.this)
+                            .sendBroadcast(new Intent("peer_lost"));
                 }
             });
         }
 
-        public void write(byte[] bytes)
+        public synchronized void write(byte[] bytes)
         {
             try {
                 // Append newline delimiter for message framing
@@ -440,19 +565,16 @@ public class Start extends AppCompatActivity {
         public void run() {
             try {
                 socket.connect(new InetSocketAddress(hostAdd, port), 5000);
+                isHost = false;
                 sendReceive = new SendReceive(socket);
                 sendReceive.start();
                 runOnUiThread(new Runnable() {
                     @SuppressLint("SetTextI18n")
                     @Override
                     public void run() {
-                        text.setText("CONNECTED (CLIENT)");
-                        Button next = (Button) findViewById(R.id.nextBtn2);
-                        Button send = (Button) findViewById(R.id.send);
-                        next.setVisibility(View.VISIBLE);
-                        next.setEnabled(true);
-                        send.setVisibility(View.VISIBLE);
-                        send.setEnabled(true);
+                        text.setText("CONNECTED - waiting for the host to start");
+                        findViewById(R.id.hostBtn).setEnabled(false);
+                        findViewById(R.id.nextBtn).setEnabled(false);
                         Toast.makeText(Start.this, "Connected to Host", Toast.LENGTH_SHORT).show();
                     }
                 });
@@ -491,37 +613,40 @@ public class Start extends AppCompatActivity {
                             intent.putExtra("idMess", tempMsg);
                             LocalBroadcastManager.getInstance(Start.this).sendBroadcast(intent);
 
-                        } else if (tempMsg.equals("start")) {
-                            resetGameState();
-                            peerCount = 1;
+                        } else if (tempMsg.startsWith("assign ")) {
+                            // The host names us. Arrives before "start" on the same socket,
+                            // so our index is set by the time the round begins.
+                            turn = Integer.parseInt(tempMsg.substring(7).trim());
+                            if (text != null) text.setText("CONNECTED - you are player " + (turn + 1));
+
+                        } else if (tempMsg.startsWith("start ")) {
+                            resetGameState(Integer.parseInt(tempMsg.substring(6).trim()));
                             Intent intent = new Intent(Start.this, Card.class);
                             startActivity(intent);
 
-                        } else if (tempMsg.equals("begin")) {
+                        } else if (tempMsg.startsWith("ready ")) {
+                            // Host-only bookkeeping; clients see these via the relay and ignore them.
+                            if (isHost) markReady(Integer.parseInt(tempMsg.substring(6).trim()));
+
+                        } else if (tempMsg.equals("go")) {
                             Intent intent = new Intent("data3");
-                            intent.putExtra("begin1", "begin");
+                            intent.putExtra("begin1", "go");
                             LocalBroadcastManager.getInstance(Start.this).sendBroadcast(intent);
 
-                        } else if (tempMsg.equals("ready")) {
-                            Intent intent = new Intent("data3");
-                            intent.putExtra("begin1", "ready");
-                            LocalBroadcastManager.getInstance(Start.this).sendBroadcast(intent);
+                        } else if (tempMsg.startsWith("left ")) {
+                            handlePlayerLeft(Integer.parseInt(tempMsg.substring(5).trim()));
 
-                        } else if (tempMsg.equals("not ready")) {
-                            if (!isFinishing() && !isDestroyed()) {
-                                Toast.makeText(Start.this, "Some of the players are still arranging", Toast.LENGTH_SHORT).show();
-                            }
+                        } else if (tempMsg.equals("replay")) {
+                            // Someone pressed PLAY AGAIN — follow them into the new round
+                            readySet.clear();
+                            LocalBroadcastManager.getInstance(Start.this)
+                                    .sendBroadcast(new Intent("remote_replay"));
 
-                        } else if (tempMsg.equals("peer")) {
-                            Card.count++;
-
-                        } else if (tempMsg.contains("bingo")) {
+                        } else if (tempMsg.startsWith("bingo ")) {
                             // Parse: "bingo <turn> <name>" — name may contain spaces
                             String[] strings = tempMsg.split(" ", 3);
                             if (strings.length >= 3) {
                                 ignoreTurn.add(strings[1]);
-                                if(!ignoreTurn.contains(turn+""))
-                                    Game.bingoNum++;
 
                                 // Tell Game.java to end the game for the losing player
                                 Intent intent = new Intent("remote_bingo");
@@ -551,27 +676,23 @@ public class Start extends AppCompatActivity {
         }
     };
 
+    /** This player finished arranging and pressed BEGIN. */
     private BroadcastReceiver tempReceiver2 = new BroadcastReceiver() {
         @Override
         public void onReceive(Context context, Intent intent) {
-            ThreadX thread = new ThreadX(intent.getStringExtra("begin"));
-            thread.start();
-        }
-    };
-
-    private BroadcastReceiver tempReceiver3 = new BroadcastReceiver() {
-        @Override
-        public void onReceive(Context context, Intent intent) {
-            ThreadX thread = new ThreadX(intent.getStringExtra("ready"));
-            thread.start();
+            if (isHost) {
+                markReady(turn);
+            } else {
+                new ThreadX("ready " + turn).start();
+            }
         }
     };
 
     private BroadcastReceiver tempReceiver4 = new BroadcastReceiver() {
         @Override
         public void onReceive(Context context, Intent intent) {
-            ThreadX thread = new ThreadX(intent.getStringExtra("peer"));
-            thread.start();
+            readySet.clear();
+            new ThreadX("replay").start();
         }
     };
 
@@ -595,6 +716,8 @@ public class Start extends AppCompatActivity {
 
         Card.count = 0;
         Card.isReplay = false;
+        isHost = false;
+        departed.clear();
         mVisible = true;
         mControlsView = findViewById(R.id.fullscreen_content_controls);
         mContentView = findViewById(R.id.fullscreen_content);
@@ -609,8 +732,7 @@ public class Start extends AppCompatActivity {
 
         LocalBroadcastManager.getInstance(this).registerReceiver(tempReceiver,new IntentFilter("data"));
         LocalBroadcastManager.getInstance(this).registerReceiver(tempReceiver2,new IntentFilter("data2"));
-        LocalBroadcastManager.getInstance(this).registerReceiver(tempReceiver3,new IntentFilter("data4"));
-        LocalBroadcastManager.getInstance(this).registerReceiver(tempReceiver4,new IntentFilter("peer"));
+        LocalBroadcastManager.getInstance(this).registerReceiver(tempReceiver4,new IntentFilter("replay"));
         LocalBroadcastManager.getInstance(this).registerReceiver(tempReceiver5,new IntentFilter("bingo"));
         ignoreTurn = new ArrayList<>();
         Button scan = (Button) findViewById(R.id.nextBtn);
@@ -620,7 +742,7 @@ public class Start extends AppCompatActivity {
         text = (TextView) findViewById(R.id.info1);
         next.setVisibility(View.INVISIBLE);
         next.setEnabled(false);
-        send.setVisibility(View.INVISIBLE);
+        send.setVisibility(View.GONE);
         send.setEnabled(false);
 
         mNsdManager = (NsdManager) getSystemService(Context.NSD_SERVICE);
@@ -628,9 +750,12 @@ public class Start extends AppCompatActivity {
         host.setOnClickListener(new View.OnClickListener() {
             @Override
             public void onClick(View v) {
+                isHost = true;
                 serverClass = new ServerClass();
                 serverClass.start();
                 host.setEnabled(false);
+                scan.setEnabled(false);
+                updateLobby();
             }
         });
 
@@ -641,15 +766,34 @@ public class Start extends AppCompatActivity {
             }
         });
 
+        // Only the host starts the match: it is the one device that knows the full roster.
         next.setOnClickListener(new View.OnClickListener() {
             @Override
             public void onClick(View view) {
-                resetGameState();
-                peerCount = 1;
-                ThreadX thread = new ThreadX("start");
-                thread.start();
-                Intent intent = new Intent(Start.this, Card.class);
-                startActivity(intent);
+                if (!isHost || connections.isEmpty() || matchStarted) return;
+
+                matchStarted = true;
+                final int players = connections.size() + 1;
+                resetGameState(players);
+                next.setEnabled(false);
+
+                new Thread(new Runnable() {
+                    @Override
+                    public void run() {
+                        // Hand out dense indexes now that the roster is fixed. The host is 0,
+                        // so a client that left the lobby earlier cannot leave a hole.
+                        synchronized (connections) {
+                            for (int i = 0; i < connections.size(); i++) {
+                                SendReceive c = connections.get(i);
+                                c.playerIndex = i + 1;
+                                c.write(("assign " + c.playerIndex).getBytes());
+                            }
+                        }
+                        sendToAll("start " + players);
+                    }
+                }).start();
+
+                startActivity(new Intent(Start.this, Card.class));
             }
         });
 
@@ -675,16 +819,6 @@ public class Start extends AppCompatActivity {
             }
         });
 
-        send.setOnClickListener(new View.OnClickListener() {
-            @Override
-            public void onClick(View view) {
-                if(sendReceive != null) {
-                    ThreadX thread = new ThreadX("TEST 123");
-                    thread.start();
-                }
-            }
-        });
-
         // Upon interacting with UI controls, delay any scheduled hide()
         // operations to prevent the jarring behavior of controls going away
         // while interacting with the UI.
@@ -700,9 +834,7 @@ public class Start extends AppCompatActivity {
 
         @Override
         public void run() {
-            if(sendReceive != null) {
-                sendReceive.write(msg.getBytes());
-            }
+            sendToAll(msg);
         }
     }
 
@@ -739,14 +871,28 @@ public class Start extends AppCompatActivity {
         mHideHandler.postDelayed(mHideRunnable, delayMillis);
     }
 
-    private void resetGameState() {
-        Card.count = 0;
-        Start.turn = 0;
-        if (Start.ignoreTurn != null) {
-            Start.ignoreTurn.clear();
+    /**
+     * Start a round with the given number of players. Indexes come from the host, never
+     * from who finished arranging first — that ordering used to be a race that could
+     * give two players the same turn number.
+     */
+    private void resetGameState(int players) {
+        Card.count = players;
+        if (isHost) Start.turn = 0;   // clients keep the index their "assign" gave them
+        Game.currentTurn = 0;
+        Game.bingoNum = 0;
+        readySet.clear();
+        clearIgnoreTurn();
+    }
+
+    /** Wipe the round's finishers but keep anyone who has left the match for good. */
+    public static void clearIgnoreTurn() {
+        if (ignoreTurn == null) {
+            ignoreTurn = new ArrayList<>();
         } else {
-            Start.ignoreTurn = new ArrayList<>();
+            ignoreTurn.clear();
         }
+        ignoreTurn.addAll(departed);
     }
 
 

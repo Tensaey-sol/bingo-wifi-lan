@@ -195,7 +195,45 @@ public class Game extends Card {
         }
         LocalBroadcastManager.getInstance(this).unregisterReceiver(tempReceiver1);
         LocalBroadcastManager.getInstance(this).unregisterReceiver(remoteBingoReceiver);
+        LocalBroadcastManager.getInstance(this).unregisterReceiver(remoteReplayReceiver);
+        LocalBroadcastManager.getInstance(this).unregisterReceiver(gamePeerLostReceiver);
+        LocalBroadcastManager.getInstance(this).unregisterReceiver(playerLeftReceiver);
     }
+
+    /** Opponent pressed PLAY AGAIN - start the same new round on this device. */
+    private final BroadcastReceiver remoteReplayReceiver = new BroadcastReceiver() {
+        @Override
+        public void onReceive(Context context, Intent intent) {
+            startReplay(false);
+        }
+    };
+
+    private final BroadcastReceiver gamePeerLostReceiver = new BroadcastReceiver() {
+        @Override
+        public void onReceive(Context context, Intent intent) {
+            endMatch("Host disconnected");
+        }
+    };
+
+    /** A player dropped out mid-round: skip them from here on. */
+    private final BroadcastReceiver playerLeftReceiver = new BroadcastReceiver() {
+        @Override
+        public void onReceive(Context context, Intent intent) {
+            if (isFinishing() || isDestroyed()) return;
+            int idx = intent.getIntExtra("playerIndex", -1);
+            if (idx < 0) return;
+
+            // Start has already put them in ignoreTurn; move on if it was their go.
+            if (currentTurn == idx) advanceTurn();
+            refreshTurnLabels();
+
+            if (count - ignoreTurn.size() < 2) {
+                endMatch("Not enough players left");
+            } else {
+                Toast.makeText(Game.this, "Player " + (idx + 1) + " left the game", Toast.LENGTH_SHORT).show();
+            }
+        }
+    };
 
     private final BroadcastReceiver remoteBingoReceiver = new BroadcastReceiver() {
         @Override
@@ -247,20 +285,8 @@ public class Game extends Card {
                         isRemoteClick = false;
 
                         // Now advance currentTurn once (the onClick skipped it)
-                        currentTurn = (currentTurn + 1) % count;
-                        while(ignoreTurn.contains(currentTurn+""))
-                            currentTurn = (currentTurn + 1) % count;
-
-                        if(currentTurn == turn) {
-                            bingo.setText("Your turn");
-                            textView.setVisibility(View.INVISIBLE);
-                        }
-                        else {
-                            bingo.setText("Not your turn");
-                            if (!isGameOverTriggered) {
-                                textView.setVisibility(View.VISIBLE);
-                            }
-                        }
+                        advanceTurn();
+                        refreshTurnLabels();
                         break L1;
                     }
                 }
@@ -280,9 +306,11 @@ public class Game extends Card {
         mContentView = findViewById(R.id.fullscreen_content);
         TextView bingo = (TextView) findViewById(R.id.bingo);
         TextView textView = (TextView) findViewById(R.id.textView4);
-        WifiManager wifiManager = (WifiManager) getApplicationContext().getSystemService(WIFI_SERVICE);
 
         LocalBroadcastManager.getInstance(this).registerReceiver(remoteBingoReceiver, new IntentFilter("remote_bingo"));
+        LocalBroadcastManager.getInstance(this).registerReceiver(remoteReplayReceiver, new IntentFilter("remote_replay"));
+        LocalBroadcastManager.getInstance(this).registerReceiver(gamePeerLostReceiver, new IntentFilter("peer_lost"));
+        LocalBroadcastManager.getInstance(this).registerReceiver(playerLeftReceiver, new IntentFilter("player_left"));
 
         SharedPreferences prefs = getSharedPreferences(PREF_NAME, Context.MODE_PRIVATE);
         isSoundOn = prefs.getBoolean(KEY_SOUND_STATE, true);
@@ -299,9 +327,6 @@ public class Game extends Card {
         textView.setOnClickListener(new View.OnClickListener() {
             @Override
             public void onClick(View view) {
-                while(ignoreTurn.contains(currentTurn+""))
-                    currentTurn = (currentTurn + 1) % count;
-
                 if(currentTurn != turn) {
                     textView.setVisibility(View.VISIBLE);
                     bingo.setText("Not your turn");
@@ -415,6 +440,7 @@ public class Game extends Card {
                     @SuppressLint({"SetTextI18n", "UseCompatLoadingForDrawables"})
                     @Override
                     public void onClick(View v) {
+                        if (isGameOverTriggered && !isRemoteClick) return;
 
                         Button btn = (Button) findViewById(v.getId());
                         Drawable cross = getDrawable(R.drawable.ic_baseline_cancel_24);
@@ -428,18 +454,8 @@ public class Game extends Card {
                                     return;
                                 }
 
-                                currentTurn = (currentTurn + 1) % count;
-                                while(ignoreTurn.contains(currentTurn+""))
-                                    currentTurn = (currentTurn + 1) % count;
-
-                                if(currentTurn != turn) {
-                                    textView.setVisibility(View.VISIBLE);
-                                    bingo.setText("Not your turn");
-                                }
-                                else {
-                                    textView.setVisibility(View.INVISIBLE);
-                                    bingo.setText("Your turn");
-                                }
+                                advanceTurn();
+                                refreshTurnLabels();
 
                                 Intent intent = new Intent("data");
                                 intent.putExtra("idMsg", btn.getText().toString());
@@ -550,6 +566,108 @@ public class Game extends Card {
         mHideHandler.postDelayed(mHideRunnable, delayMillis);
     }
 
+    @SuppressLint("SetTextI18n")
+    private void refreshTurnLabels() {
+        TextView bingo = (TextView) findViewById(R.id.bingo);
+        View overlay = findViewById(R.id.textView4);
+        if (currentTurn == turn) {
+            bingo.setText("Your turn");
+            overlay.setVisibility(View.INVISIBLE);
+        } else {
+            bingo.setText("Not your turn");
+            if (!isGameOverTriggered) {
+                overlay.setVisibility(View.VISIBLE);
+            }
+        }
+    }
+
+    /**
+     * Advance to the next player who has not already finished. Bounded by count so a
+     * fully-retired ignoreTurn list cannot spin forever, and a count of 0 cannot
+     * divide by zero.
+     */
+    private static void advanceTurn() {
+        if (count <= 0) return;
+        for (int k = 0; k < count; k++) {
+            currentTurn = (currentTurn + 1) % count;
+            if (!ignoreTurn.contains(currentTurn + "")) return;
+        }
+    }
+
+    /**
+     * Reset for a fresh round and go back to the card-arranging screen.
+     * When notifyPeer is true this device initiated it and tells the opponent,
+     * so both sides replay together instead of one being left behind.
+     */
+    private void startReplay(boolean notifyPeer) {
+        if (isFinishing() || isDestroyed()) return;
+
+        if (notifyPeer) {
+            Intent replayIntent = new Intent("replay");
+            replayIntent.putExtra("replay", "replay");
+            LocalBroadcastManager.getInstance(this).sendBroadcast(replayIntent);
+        }
+
+        Game.currentTurn = 0;
+        Game.bingoNum = 0;
+        Card.isReplay = true; // Preserve Card.count and player indexes across replays
+        Start.clearIgnoreTurn();
+
+        // Stop victory music; the next screen starts its own
+        if (mediaPlayer != null) {
+            try {
+                mediaPlayer.stop();
+                mediaPlayer.release();
+            } catch (Exception e) { e.printStackTrace(); }
+            mediaPlayer = null;
+        }
+
+        startActivity(new Intent(Game.this, Card.class));
+        finish();
+    }
+
+    /** Not enough players to carry on: end the round rather than waiting forever. */
+    @SuppressLint("SetTextI18n")
+    private void endMatch(String reason) {
+        if (isFinishing() || isDestroyed()) return;
+
+        Button play = (Button) findViewById(R.id.playagain);
+        Button quit = (Button) findViewById(R.id.quitbutton);
+
+        // A replay needs the rest of the table, so that option is gone either way.
+        play.setEnabled(false);
+        play.setVisibility(View.INVISIBLE);
+
+        if (!isGameOverTriggered) {
+            isGameOverTriggered = true;
+            ((TextView) findViewById(R.id.bingo)).setText(reason);
+            findViewById(R.id.textView4).setVisibility(View.INVISIBLE);
+        }
+        Toast.makeText(Game.this, reason, Toast.LENGTH_LONG).show();
+
+        quit.setEnabled(true);
+        quit.setVisibility(View.VISIBLE);
+        quit.setText("QUIT");
+        setUpQuitButton(quit);
+    }
+
+    private void setUpQuitButton(Button quit) {
+        quit.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                // Stop music before quitting
+                if (mediaPlayer != null) {
+                    try {
+                        mediaPlayer.stop();
+                        mediaPlayer.release();
+                    } catch (Exception e) { e.printStackTrace(); }
+                    mediaPlayer = null;
+                }
+                finishAffinity();
+            }
+        });
+    }
+
     @SuppressLint("UseCompatLoadingForDrawables")
     public void triggerGameOver(boolean isWinner, String winnerName) {
         // Prevent double-trigger
@@ -651,50 +769,15 @@ public class Game extends Card {
             }
         }
 
-        // PLAY AGAIN: reset game state and go back to Card for a new round
+        // PLAY AGAIN: reset game state, tell the opponent, and go back to Card
         play.setOnClickListener(new View.OnClickListener() {
             @Override
             public void onClick(View v) {
-                // Reset all game state for a fresh round
-                Game.currentTurn = 0;
-                Game.bingoNum = 0;
-                Card.isReplay = true; // Preserve Card.count and start turn across replays
-                if (Start.ignoreTurn != null) {
-                    Start.ignoreTurn.clear();
-                } else {
-                    Start.ignoreTurn = new java.util.ArrayList<>();
-                }
-
-                // Stop victory music and restart menu music
-                if (mediaPlayer != null) {
-                    try {
-                        mediaPlayer.stop();
-                        mediaPlayer.release();
-                    } catch (Exception e) { e.printStackTrace(); }
-                    mediaPlayer = null;
-                }
-
-                // Navigate to Card to arrange a new board
-                Intent intent = new Intent(Game.this, Card.class);
-                startActivity(intent);
-                finish();
+                startReplay(true);
             }
         });
 
-        quit.setOnClickListener(new View.OnClickListener() {
-            @Override
-            public void onClick(View v) {
-                // Stop music before quitting
-                if (mediaPlayer != null) {
-                    try {
-                        mediaPlayer.stop();
-                        mediaPlayer.release();
-                    } catch (Exception e) { e.printStackTrace(); }
-                    mediaPlayer = null;
-                }
-                finishAffinity();
-            }
-        });
+        setUpQuitButton(quit);
 
         if (isWinner) {
             bingoNum++;
